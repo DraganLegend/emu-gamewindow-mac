@@ -1,0 +1,26 @@
+emu-gamewindow-mac
+Copyright 2026 The emu-gamewindow-mac authors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes the following third-party material:
+
+- Sources/EGWHost/emulator_controller.proto
+  Copyright (C) 2018 The Android Open Source Project
+  Licensed under the Apache License, Version 2.0.
+  From the Android Emulator (shipped with Android Emulator 37.2.12 in
+  emulator/lib/emulator_controller.proto).
+
+Swift package dependencies (downloaded by SwiftPM, not redistributed here):
+
+- grpc-swift-2, grpc-swift-nio-transport, grpc-swift-protobuf
+  Copyright the gRPC authors. Apache License 2.0.
+- swift-protobuf
+  Copyright Apple Inc. and the SwiftProtobuf project authors. Apache License 2.0.
+- Their transitive dependencies (swift-nio and related Apple packages) are
+  listed in Package.resolved, each under its own license (Apache License 2.0).
+
+This project is not affiliated with or endorsed by Google, the Android Open
+Source Project, Apple, or any game publisher. Android is a trademark of
+Google LLC. The Android SDK, Emulator and system images are not included;
+you download them from Google and accept Google's license terms yourself.

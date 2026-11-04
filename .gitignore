@@ -1,0 +1,13 @@
+# Build output and SwiftPM state
+.build/
+*.app/
+
+# Everything machine-specific: Android SDK, AVDs, Android user data,
+# emulator logs, play reports, keymaps, screenshots, frame mappings
+.runtime/
+
+# Your own settings (see egw.config.example.json)
+egw.config.json
+
+# macOS
+.DS_Store

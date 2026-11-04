@@ -1,0 +1,319 @@
+#!/bin/bash
+# egw — daily entry for Emu Game Window. Machine-specific values: egw.config.json.
+#   egw status                 where the emulator is (no key, no RPC)
+#   egw start [--audio] [--verbose] [--window]  start the AVD (emulator window hidden unless --window)
+#   egw play [--minutes N] [--rotate 0|90|180|270] [--stream-rotation-map cw|ccw|none] [--no-fast-path]
+#                              [--present standard|low|nosync|nosync3]  (default nosync3)
+#                              open the game window (asks you to confirm USB debugging is OFF)
+#   egw stop [--android|--chord|--short] [--yes]  shut down: one SIGTERM, wait 60 s, never SIGKILL (default);
+#                              --android: press the power key, then tap "Power off" in Android
+#   egw space                  disk overview: thresholds, AVD growth, what can be cleaned
+#   egw clean [--include-build] [--apply]  list (default) or move regenerable items to the Trash
+#   egw build                  build the host binary
+#   egw app                    build and package the app (does not open it)
+#   egw install                copy the packaged app to /Applications/<appName>.app (does not open it)
+# Never force-kills (SIGKILL) or signals twice, uses ADB, changes GPU/AVD
+# settings, permanently deletes files or empties the Trash.
+set -euo pipefail
+umask 077
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STATE="$ROOT/.runtime/state"
+HOST_CONFIG="$ROOT/scripts/host_config.py"
+POLICY="$ROOT/scripts/space_policy.py"
+
+die() { echo "egw: $*" >&2; exit 1; }
+config() { python3 -I "$HOST_CONFIG" get "$1" || die "egw.config.json is not usable."; }
+
+APP_NAME="$(config appName)"
+APP="$STATE/app/$APP_NAME.app"
+BIN="$ROOT/.build/arm64-apple-macosx/debug/egw-host"
+# After `egw clean --include-build` the build output is gone; the app carries the same binary.
+if [ ! -x "$BIN" ] && [ -x "$APP/Contents/MacOS/egw-host" ]; then BIN="$APP/Contents/MacOS/egw-host"; fi
+need_bin() { [ -x "$BIN" ] || die "host binary not found; run: egw build"; }
+
+# stop = AVD remaining growth + 8 GiB, warn = + 15 GiB (see space_policy.py).
+check_capacity() {
+  python3 -I "$POLICY" check || die "not enough free disk space; see egw space / egw clean."
+}
+
+# Prints the state word; returns the binary's exit code (0 running, 3 stopped, 4 starting, 5 lost, 6 ambiguous).
+runtime_state() {
+  local out code=0
+  out="$("$BIN" status)" || code=$?
+  python3 -I -c 'import json,sys; print(json.loads(sys.argv[1]).get("state","unknown"))' "$out" 2>/dev/null || echo unknown
+  return "$code"
+}
+
+describe() {
+  case "$1" in
+    running) echo "running (discovery found; Android may still be booting)" ;;
+    stopped) echo "stopped" ;;
+    starting) echo "starting (process exists, no discovery file yet)" ;;
+    lost) echo "lost (discovery file left but the process is gone; not cleaned automatically)" ;;
+    ambiguous) echo "ambiguous (more than one instance; nothing is chosen or stopped automatically)" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+confirm() {
+  local answer
+  [ -r /dev/tty ] || die "needs an interactive confirmation but there is no terminal."
+  read -r -p "$1 [y/N] " answer </dev/tty
+  [ "$answer" = "y" ] || [ "$answer" = "Y" ]
+}
+
+cmd_status() {
+  need_bin
+  local state code=0
+  state="$(runtime_state)" || code=$?
+  echo "Emulator: $(describe "$state")"
+  return "$code"
+}
+
+cmd_start() {
+  # The emulator's own window is hidden by default: the game window is the UI.
+  local audio=0 verbose=() window=(-no-window)
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --audio) audio=1; shift ;;
+      --verbose) verbose=(-verbose); shift ;;
+      --window) window=(); shift ;;
+      *) die "start only accepts --audio, --verbose, --window" ;;
+    esac
+  done
+  need_bin
+  local state code=0
+  state="$(runtime_state)" || code=$?
+  [ "$code" -eq 3 ] || die "emulator is $(describe "$state"); not starting a second one."
+  check_capacity
+  # shellcheck source=/dev/null
+  source "$ROOT/scripts/env.sh"
+  local audio_flag=(-no-audio)
+  if [ "$audio" -eq 1 ]; then audio_flag=(); fi
+  mkdir -p "$ROOT/.runtime/logs"
+  local log; log="$ROOT/.runtime/logs/emulator-$(date +%Y%m%d-%H%M%S).log"
+  if [ ${#window[@]} -gt 0 ]; then echo "Emulator window hidden; shut down with egw stop. Add --window to show it."; fi
+  nohup "$ANDROID_HOME/emulator/emulator" -avd "$EGW_AVD" -ports "$EGW_CONSOLE_PORT,$((EGW_CONSOLE_PORT + 1))" \
+    -accel on -gpu host -memory 4096 -cores 4 \
+    -no-snapshot -no-boot-anim ${audio_flag[@]+"${audio_flag[@]}"} -no-metrics \
+    -camera-back none -camera-front none ${verbose[@]+"${verbose[@]}"} ${window[@]+"${window[@]}"} \
+    -grpc "$EGW_GRPC_PORT" -grpc-use-jwt </dev/null >"$log" 2>&1 &
+  disown || true
+  echo "Started; log: $log"
+  local waited=0
+  while [ "$waited" -lt 180 ]; do
+    sleep 3; waited=$((waited + 3))
+    code=0; state="$(runtime_state)" || code=$?
+    if [ "$code" -eq 0 ]; then echo "Emulator: $(describe "$state")"; return 0; fi
+    if [ "$code" -eq 5 ] || [ "$code" -eq 6 ]; then die "emulator: $(describe "$state")"; fi
+  done
+  die "no discovery file within 180 s (state: $(describe "$state")); not retrying, see the log."
+}
+
+cmd_play() {
+  local minutes=120 extra=() fast=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --minutes) [ $# -ge 2 ] || die "--minutes needs a value"; minutes="$2"; shift 2 ;;
+      --rotate|--stream-rotation-map|--present) [ $# -ge 2 ] || die "$1 needs a value"; extra+=("$1" "$2"); shift 2 ;;
+      --fast-path) fast=1; shift ;;
+      --no-fast-path) fast=0; shift ;;
+      *) die "play only accepts --minutes, --rotate, --stream-rotation-map, --no-fast-path, --present" ;;
+    esac
+  done
+  [[ "$minutes" =~ ^[0-9]+$ ]] && [ "$minutes" -ge 1 ] && [ "$minutes" -le 240 ] || die "--minutes must be 1-240"
+  [ "$fast" -eq 1 ] && extra+=("--fast-path")
+  need_bin
+  local state code=0
+  state="$(runtime_state)" || code=$?
+  [ "$code" -eq 0 ] || die "emulator is $(describe "$state"); cannot open the game window."
+  check_capacity
+  confirm "Is USB debugging OFF in Android?" || die "USB debugging not confirmed OFF; stopping."
+  confirm "Open the game window for playing (input goes to whatever app is in front)?" || die "not confirmed; stopping."
+  mkdir -p "$STATE"
+  local stamp report stderr
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  report="$STATE/play-$stamp.json"
+  stderr="$STATE/play-$stamp.stderr.txt"
+  local seconds=$((minutes * 60))
+  [ "$seconds" -ge 30 ] || seconds=30
+  echo "Opening the game window (up to ${minutes} min). Cmd-E edit keys, Cmd-R rotate, Cmd-Q quit."
+  code=0
+  "$BIN" game-view --auto --usb-off-confirmed --game-in-use --seconds "$seconds" ${extra[@]+"${extra[@]}"} \
+    >"$report" 2>"$stderr" || code=$?
+  python3 -I - "$report" <<'PY' || true
+import json, sys
+try:
+    r = json.load(open(sys.argv[1]))
+except Exception:
+    print("Report unreadable."); sys.exit(0)
+print("Result: " + ("ended normally" if r.get("transportCompleted") else "did not end normally (error=%s)" % r.get("error")))
+print("Touches %s, failed %s; contacts held at end %s; key revoked: %s" % (
+    r.get("touchRequests"), r.get("touchFailures"), r.get("contactsHeldAtEnd"), r.get("keyRevoked")))
+s = r.get("summary") or {}
+if s:
+    print("Frames %s (%s fps), interval P50 %s ms / P95 %s ms, delivery P50 %s ms" % (
+        s.get("frames"), s.get("fps"), s.get("intervalMsP50"), s.get("intervalMsP95"), s.get("latencyMsP50")))
+print("Frame path: %s / %s%s%s" % (r.get("frameTransport"), r.get("renderer"),
+      " (present %s%s)" % (r["presentMode"], ", draw on arrival" if r.get("drawOnArrival") else "") if r.get("presentMode") else "",
+      " (fast path off: %s)" % r["fastPathFallback"] if r.get("fastPathFallback") else ""))
+w = r.get("displayWaitMs") or {}; pm = r.get("presentMs") or {}
+if w:
+    print("Display: wait P50 %s / P95 %s ms%s; superseded %s; worst thermal state %s" % (w.get("p50"), w.get("p95"),
+          ", present P50 %s / P95 %s ms" % (pm.get("p50"), pm.get("p95")) if pm else "",
+          r.get("framesSuperseded"), r.get("thermalWorst")))
+e = r.get("emulatorPerf") or {}
+print("CPU: game window %s%%%s" % (r.get("hostCpuPercent"),
+      "; emulator avg %s%%, max %s%% (%s samples)" % (e.get("cpuPercentAvg"), e.get("cpuPercentMax"), e.get("samples")) if e else ""))
+PY
+  echo "Report: $report"
+  return "$code"
+}
+
+cmd_stop() {
+  # Default: quick shutdown = one SIGTERM (the emulator saves and exits).
+  # --android presses the power key; on some images a long press opens the assistant instead.
+  local mode=host power=long yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --host) mode=host; shift ;;
+      --android) mode=android; shift ;;
+      --chord) mode=android; power=chord; shift ;;
+      --short) mode=android; power=short; shift ;;
+      --yes) yes=1; shift ;;
+      *) die "stop only accepts --android, --chord, --short, --host, --yes" ;;
+    esac
+  done
+  need_bin
+  local state code=0
+  state="$(runtime_state)" || code=$?
+  if [ "$code" -eq 3 ]; then echo "Emulator: stopped"; return 0; fi
+  [ "$code" -eq 0 ] || die "emulator is $(describe "$state"); not handling it automatically."
+  if [ "$yes" -eq 0 ]; then
+    confirm "Game saved and closed, game window closed?" || die "cancelled."
+    if [ "$mode" = android ]; then confirm "Is USB debugging OFF in Android?" || die "USB debugging not confirmed OFF; stopping."; fi
+    if [ "$mode" = host ]; then confirm "Send one SIGTERM to the emulator and wait up to 60 s?" || die "cancelled."; fi
+  fi
+  local out
+  if [ "$mode" = host ]; then
+    echo "Sending one SIGTERM, waiting up to 60 s (never forced)..."
+    code=0; out="$("$BIN" terminate --confirmed)" || code=$?
+    python3 -I -c 'import json,sys; r=json.loads(sys.argv[1]); print("Result: " + ("exited (%.1f s)" % r["waitedSeconds"] if r.get("exited") else "still running (%s)" % r.get("error")))' "$out" || true
+    if [ "$code" -ne 0 ]; then echo "Close it from the emulator window instead (egw start --window); egw will not signal again."; return 2; fi
+  else
+    code=0; out="$("$BIN" power-key --usb-off-confirmed --mode "$power")" || code=$?
+    if [ "$code" -ne 0 ]; then
+      python3 -I -c 'import json,sys; print("Power key failed: %s" % json.loads(sys.argv[1]).get("error"))' "$out" 2>/dev/null || echo "Power key failed."
+      return 2
+    fi
+    echo "Power key sent. Tap \"Power off\" in the emulator."
+    local waited=0
+    while [ "$waited" -lt 120 ]; do
+      sleep 3; waited=$((waited + 3))
+      code=0; state="$(runtime_state)" || code=$?
+      [ "$code" -eq 0 ] || break
+    done
+    if [ "$code" -eq 0 ]; then echo "Still running after 120 s; doing nothing else."; return 2; fi
+  fi
+  sleep 2
+  code=0; state="$(runtime_state)" || code=$?
+  echo "Emulator: $(describe "$state")"
+  [ "$code" -eq 3 ]
+}
+
+cmd_build() {
+  check_capacity
+  python3 -I "$ROOT/scripts/build.py" build
+  BIN="$ROOT/.build/arm64-apple-macosx/debug/egw-host"
+  [ -x "$BIN" ] || die "build finished but the binary is missing: $BIN"
+}
+
+cmd_app() {
+  cmd_build
+  python3 -I "$ROOT/scripts/package_app.py"
+  if [ -d "/Applications/$APP_NAME.app" ]; then echo "/Applications/$APP_NAME.app is not updated yet; run egw install."; fi
+}
+
+cmd_install() {
+  # Copies (never deletes): ditto overwrites the bundle's files in place.
+  local dst="/Applications/$APP_NAME.app"
+  [ -x "$APP/Contents/MacOS/egw-host" ] || die "no packaged app; run egw app first."
+  /usr/bin/ditto "$APP" "$dst" || die "copy to $dst failed."
+  /usr/bin/codesign --verify "$dst" 2>/dev/null || echo "note: signature check of $dst failed."
+  echo "Installed: $dst (not opened; Spotlight finds it as $APP_NAME)"
+}
+
+cmd_space() {
+  need_bin
+  local out
+  out="$("$BIN" space)"
+  python3 -I - "$out" <<'PY'
+import json, sys
+r = json.loads(sys.argv[1]); g = lambda b: "%.1f GiB" % (b / 1024 ** 3)
+print(r["summary"])
+if r.get("fallback"):
+    print("(AVD size unreadable; using the 20 GiB stop / 27 GiB warn fallback)")
+else:
+    print("AVD data image: %s of %s, can still grow %s" % (g(r["avdCurrentBytes"]), g(r["avdMaxBytes"]), g(r["avdRemainingBytes"])))
+labels = {"appArchive": "old app bundles", "testRun": "build/test logs", "emulatorLog": "emulator logs",
+          "playReport": "play reports", "download": "installer archives", "buildProduct": "build products (--include-build)",
+          "frameMap": "leftover frame mappings"}
+print("Cleanable (to the Trash): %s in %d items; %d kept because docs mention them" % (g(r["cleanableBytes"]), r["cleanableCount"], r["keptAsEvidence"]))
+for key, value in sorted(r["cleanableByCategory"].items(), key=lambda kv: -kv[1]):
+    print("  - %s: %s" % (labels.get(key, key), g(value)))
+PY
+}
+
+cmd_clean() {
+  local include=() apply=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --include-build) include=(--include-build); shift ;;
+      --apply) apply=1; shift ;;
+      *) die "clean only accepts --include-build, --apply" ;;
+    esac
+  done
+  need_bin
+  local out
+  out="$("$BIN" clean ${include[@]+"${include[@]}"})"
+  python3 -I - "$out" <<'PY'
+import json, sys
+r = json.loads(sys.argv[1]); g = lambda b: "%.2f GiB" % (b / 1024 ** 3)
+for path in r["items"]:
+    print("  " + path)
+print("Total %d items, about %s." % (r["count"], g(r["bytes"])))
+if r["keptAsEvidence"]:
+    print("Kept because docs mention them: %d" % len(r["keptAsEvidence"]))
+PY
+  if [ "$apply" -eq 0 ]; then
+    echo "List only. To move these to the Trash run: egw clean${include[@]+" ${include[*]}"} --apply"
+    return 0
+  fi
+  python3 -I -c 'import json,sys; sys.exit(0 if json.loads(sys.argv[1])["count"] else 1)' "$out" || { echo "Nothing to clean."; return 0; }
+  confirm "Move the items above to the Trash? (recoverable; empty the Trash to free the space)" || die "cancelled."
+  out="$("$BIN" clean ${include[@]+"${include[@]}"} --apply --confirmed)"
+  python3 -I - "$out" <<'PY'
+import json, sys
+r = json.loads(sys.argv[1])
+print("Moved to the Trash: %d items, about %.2f GiB." % (r.get("movedToTrash", 0), r.get("movedBytes", 0) / 1024 ** 3))
+if r.get("skipped"):
+    print("Skipped (changed or not movable):")
+    for path in r["skipped"]:
+        print("  " + path)
+print("Empty the Trash yourself to free the space.")
+PY
+}
+
+case "${1:-}" in
+  status) shift; cmd_status "$@" ;;
+  start) shift; cmd_start "$@" ;;
+  play) shift; cmd_play "$@" ;;
+  stop) shift; cmd_stop "$@" ;;
+  build) shift; cmd_build "$@" ;;
+  space) shift; cmd_space "$@" ;;
+  clean) shift; cmd_clean "$@" ;;
+  app) shift; cmd_app "$@" ;;
+  install) shift; cmd_install "$@" ;;
+  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 64 ;;
+esac

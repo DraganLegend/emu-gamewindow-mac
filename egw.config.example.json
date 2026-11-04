@@ -1,0 +1,7 @@
+{
+  "avd": "egw_api35_arm64",
+  "grpcPort": 8554,
+  "consolePort": 5554,
+  "bundleIdentifier": "local.egw-launcher",
+  "appName": "EmuGameWindow"
+}
